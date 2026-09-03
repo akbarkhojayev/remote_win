@@ -1,0 +1,8 @@
+aiogram>=3.14.0
+psutil>=6.0.0
+aiofiles>=24.1.0
+pywin32>=306
+pycaw>=20240210
+opencv-python>=4.10.0
+pyperclip>=1.9.0
+plyer>=2.1.0
