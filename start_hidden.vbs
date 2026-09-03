@@ -1,4 +1,11 @@
 Set WshShell = CreateObject("WScript.Shell")
-strPath = CreateObject("Scripting.FileSystemObject").GetParentFolderName(WScript.ScriptFullName)
+Set FSO = CreateObject("Scripting.FileSystemObject")
+strPath = FSO.GetParentFolderName(WScript.ScriptFullName)
 WshShell.CurrentDirectory = strPath
-WshShell.Run "cmd /c venv\Scripts\pythonw.exe bot.py", 0, False
+
+strPythonw = strPath & "\venv\Scripts\pythonw.exe"
+If FSO.FileExists(strPythonw) Then
+    WshShell.Run """" & strPythonw & """ bot.py", 0, False
+Else
+    WshShell.Run "cmd /c py -3 -m bot", 0, False
+End If

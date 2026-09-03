@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import ctypes
+from ctypes import wintypes
 import json
 import logging
 import os
@@ -8,13 +10,13 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import aiofiles
 import psutil
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -26,6 +28,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
+    TelegramObject,
 )
 
 # ==============================================================================
@@ -43,6 +46,9 @@ def load_env_file(filepath: str = ".env") -> None:
             key, val = line.split("=", 1)
             key = key.strip()
             val = val.strip().strip("'\"")
+            # Izohlarni tozalash (agar satr oxirida bo'lsa)
+            if " #" in val:
+                val = val.split(" #")[0].strip().strip("'\"")
             if key not in os.environ:
                 os.environ[key] = val
 
@@ -60,34 +66,36 @@ if not BOT_TOKEN or not ADMIN_ID_RAW or ADMIN_ID_RAW == "0":
 try:
     ADMIN_ID = int(ADMIN_ID_RAW)
 except ValueError:
-    print(f"XATOLIK: ADMIN_ID son bo'lishi kerak, berilgan qiymat: {ADMIN_ID_RAW}")
+    print(f"XATOLIK: ADMIN_ID butun son bo'lishi kerak, berilgan: {ADMIN_ID_RAW}")
     sys.exit(1)
 
+DEVICE_NAME = os.environ.get("DEVICE_NAME", "").strip()
 TIMEZONE_STR = os.environ.get("TIMEZONE", "Asia/Tashkent")
+
 try:
     import zoneinfo
     UZ_TZ = zoneinfo.ZoneInfo(TIMEZONE_STR)
 except Exception:
     UZ_TZ = timezone(timedelta(hours=5))
 
-TRACK_INTERVAL_SECONDS = int(os.environ.get("TRACK_INTERVAL_SECONDS", "60"))
+TRACK_INTERVAL_SECONDS = max(10, int(os.environ.get("TRACK_INTERVAL_SECONDS", "60")))
 DAILY_REPORT_HOUR = int(os.environ.get("DAILY_REPORT_HOUR", "23"))
 DAILY_REPORT_MINUTE = int(os.environ.get("DAILY_REPORT_MINUTE", "55"))
 LOW_BATTERY_THRESHOLD = int(os.environ.get("LOW_BATTERY_THRESHOLD", "20"))
 STATS_FILE = os.path.join(BASE_DIR, "daily_stats.json")
+HISTORY_DIR = os.path.join(BASE_DIR, "history")
+os.makedirs(HISTORY_DIR, exist_ok=True)
 
 # ==============================================================================
-# 2. LOGGING SOZLAMALARI
+# 2. LOGGING SOZLAMALARI (Faqat Konsol / Stdout)
 # ==============================================================================
 
-LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-LOG_FILE = os.path.join(BASE_DIR, "remote_bot.log")
+LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
 
 logging.basicConfig(
     level=logging.INFO,
     format=LOG_FORMAT,
     handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -106,12 +114,13 @@ daily_stats: Dict[str, Any] = {
 
 low_battery_notified = False
 
-SYSTEM_IGNORE_CLASSES = {
+SYSTEM_IGNORE_APPS = {
     "", "unknown", "bosh ekran", "desktop", "explorer", "taskbar",
-    "applicationframehost", "shellexperiencehost", "lockapp"
+    "applicationframehost", "shellexperiencehost", "lockapp", "searchapp",
+    "startmenuexperiencehost", "systemsettings"
 }
 
-def load_daily_stats():
+def load_daily_stats() -> None:
     global daily_stats
     today_str = datetime.now(UZ_TZ).strftime("%Y-%m-%d")
     if os.path.exists(STATS_FILE):
@@ -122,6 +131,15 @@ def load_daily_stats():
                     daily_stats = data
                     logger.info(f"Bugungi statistika qayta tiklandi ({today_str}).")
                     return
+                else:
+                    # Kechagi statistikani arxivga saqlash
+                    old_date = data.get("date", "previous")
+                    archive_path = os.path.join(HISTORY_DIR, f"stats_{old_date}.json")
+                    try:
+                        with open(archive_path, "w", encoding="utf-8") as af:
+                            json.dump(data, af, ensure_ascii=False, indent=2)
+                    except Exception:
+                        pass
         except Exception as e:
             logger.error(f"Statistika faylini o'qishda xatolik: {e}")
 
@@ -133,7 +151,7 @@ def load_daily_stats():
     }
     save_daily_stats()
 
-def save_daily_stats():
+def save_daily_stats() -> None:
     try:
         temp_file = STATS_FILE + ".tmp"
         with open(temp_file, "w", encoding="utf-8") as f:
@@ -149,10 +167,10 @@ def save_daily_stats():
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Holat"), KeyboardButton(text="📸 Kamera")],
-        [KeyboardButton(text="🎵 Spotify"), KeyboardButton(text="🔊 Ovoz")],
-        [KeyboardButton(text="🔒 Qulflash"), KeyboardButton(text="📋 Clipboard")],
-        [KeyboardButton(text="📅 Kunlik hisobot"), KeyboardButton(text="🔔 Xabar yuborish")],
-        [KeyboardButton(text="🔄 Qayta yoqish"), KeyboardButton(text="🛑 O'chirish")],
+        [KeyboardButton(text="🖥 Ekran (Skrinshot)"), KeyboardButton(text="🎵 Spotify")],
+        [KeyboardButton(text="🔊 Ovoz"), KeyboardButton(text="🔒 Qulflash")],
+        [KeyboardButton(text="📋 Clipboard"), KeyboardButton(text="🔔 Xabar yuborish")],
+        [KeyboardButton(text="📅 Kunlik hisobot"), KeyboardButton(text="⚡️ Quvvat / O'chirish")],
     ],
     resize_keyboard=True,
 )
@@ -162,7 +180,12 @@ status_inline_kb = InlineKeyboardMarkup(
         [
             InlineKeyboardButton(text="🔄 Yangilash", callback_data="status_refresh"),
             InlineKeyboardButton(text="📸 Kamera", callback_data="quick_photo"),
+            InlineKeyboardButton(text="🖥 Ekran", callback_data="quick_screenshot"),
+        ],
+        [
             InlineKeyboardButton(text="🎵 Spotify", callback_data="quick_music"),
+            InlineKeyboardButton(text="🔊 Ovoz", callback_data="quick_volume"),
+            InlineKeyboardButton(text="🔒 Qulflash", callback_data="quick_lock"),
         ]
     ]
 )
@@ -176,6 +199,7 @@ music_inline_kb = InlineKeyboardMarkup(
         ],
         [
             InlineKeyboardButton(text="🔄 Yangilash", callback_data="mus_refresh"),
+            InlineKeyboardButton(text="🚀 Spotify'ni ochish", callback_data="mus_open"),
         ]
     ]
 )
@@ -186,6 +210,9 @@ volume_kb = InlineKeyboardMarkup(
             InlineKeyboardButton(text="🔉 -10%", callback_data="vol_down"),
             InlineKeyboardButton(text="🔇 Mute / Unmute", callback_data="vol_mute"),
             InlineKeyboardButton(text="🔊 +10%", callback_data="vol_up"),
+        ],
+        [
+            InlineKeyboardButton(text="🔄 Yangilash", callback_data="vol_refresh"),
         ]
     ]
 )
@@ -199,12 +226,24 @@ clipboard_kb = InlineKeyboardMarkup(
     ]
 )
 
+power_menu_kb = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔄 Qayta yoqish (Reboot)", callback_data="ask_reboot"),
+            InlineKeyboardButton(text="🛑 Butunlay o'chirish (Shutdown)", callback_data="ask_shutdown"),
+        ],
+        [
+            InlineKeyboardButton(text="🔒 Ekranni qulflash", callback_data="quick_lock"),
+        ]
+    ]
+)
+
 def confirm_kb(action: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Ha, tasdiqlayman", callback_data=f"confirm_{action}"),
-                InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel"),
+                InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_action"),
             ]
         ]
     )
@@ -220,15 +259,14 @@ class ClipboardState(StatesGroup):
 # ==============================================================================
 
 def get_device_name() -> str:
-    env_name = os.environ.get("DEVICE_NAME", "").strip()
-    if env_name:
-        return env_name
+    if DEVICE_NAME:
+        return DEVICE_NAME
     try:
         return socket.gethostname()
     except Exception:
         return f"Windows {platform.release()} PC"
 
-def make_progress_bar(percent: int, length: int = 8) -> str:
+def make_progress_bar(percent: float, length: int = 8) -> str:
     filled = int(round(length * (percent / 100)))
     filled = max(0, min(length, filled))
     return "■" * filled + "□" * (length - filled)
@@ -243,6 +281,8 @@ def clean_app_name(raw_name: str) -> str:
         "chrome": "Google Chrome",
         "msedge": "Microsoft Edge",
         "firefox": "Firefox",
+        "opera": "Opera",
+        "brave": "Brave Browser",
         "spotify": "Spotify",
         "pycharm64": "PyCharm",
         "pycharm": "PyCharm",
@@ -250,6 +290,7 @@ def clean_app_name(raw_name: str) -> str:
         "devenv": "Visual Studio",
         "idea64": "IntelliJ IDEA",
         "clion64": "CLion",
+        "webstorm64": "WebStorm",
         "windowsterminal": "Windows Terminal",
         "cmd": "Buyruqlar satri (CMD)",
         "powershell": "PowerShell",
@@ -258,105 +299,185 @@ def clean_app_name(raw_name: str) -> str:
         "obsidian": "Obsidian",
         "notion": "Notion",
         "discord": "Discord",
+        "word": "Microsoft Word",
+        "excel": "Microsoft Excel",
+        "powerpnt": "Microsoft PowerPoint",
     }
     for k, v in app_map.items():
         if k in raw_lower:
             return v
     return raw_name.replace(".exe", "").capitalize()
 
-def _sync_get_active_window_name() -> str:
+# --- Faol Oyna va Jarayon (Ctypes orqali xavfsiz) ---
+def _sync_get_active_window_info() -> Tuple[str, str]:
     try:
-        import win32gui
-        import win32process
-        hwnd = win32gui.GetForegroundWindow()
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
         if not hwnd:
-            return "Bosh ekran"
-        _, pid = win32process.GetWindowThreadProcessId(hwnd)
-        proc = psutil.Process(pid)
-        app_name = proc.name()
-        return clean_app_name(app_name)
+            return "Bosh ekran", ""
+        
+        pid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        
+        title = ""
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length > 0:
+            buff = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buff, length + 1)
+            title = buff.value.strip()
+
+        app_name = "Bosh ekran"
+        if pid.value > 0:
+            try:
+                proc = psutil.Process(pid.value)
+                app_name = clean_app_name(proc.name())
+            except Exception:
+                app_name = "Bosh ekran"
+
+        return app_name, title
     except Exception:
-        pass
-    return "Bosh ekran"
+        return "Bosh ekran", ""
 
 async def get_active_window_name() -> str:
-    return await asyncio.to_thread(_sync_get_active_window_name)
+    app_name, _ = await asyncio.to_thread(_sync_get_active_window_info)
+    return app_name
 
-def _sync_get_wifi_name() -> str:
+async def get_active_window_full() -> Tuple[str, str]:
+    return await asyncio.to_thread(_sync_get_active_window_info)
+
+# --- Tarmoq va Wi-Fi aniqlash ---
+def _sync_get_network_info() -> Tuple[str, str]:
+    network_name = "Ulanmagan"
+    
+    # 1. PowerShell Get-NetConnectionProfile (Windows 10/11 da admin huquqisiz ishlaydi)
     try:
-        out = subprocess.check_output(
-            ["netsh", "wlan", "show", "interfaces"],
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
-            timeout=2
-        ).decode("utf-8", errors="ignore")
-        match = re.search(r"^\s*SSID\s*:\s*(.+)$", out, re.MULTILINE)
-        if match:
-            ssid = match.group(1).strip()
-            if ssid and ssid != "None":
-                return ssid
+        cmd = "Get-NetConnectionProfile | Select-Object Name, InterfaceAlias, IPv4Connectivity | ConvertTo-Json"
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", cmd],
+            capture_output=True,
+            text=True,
+            timeout=3
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            try:
+                data = json.loads(res.stdout)
+                if isinstance(data, list) and len(data) > 0:
+                    data = data[0]
+                if isinstance(data, dict):
+                    name = data.get("Name")
+                    if name:
+                        network_name = name
+            except Exception:
+                pass
     except Exception:
         pass
-    return "Ulanmagan"
 
-async def get_wifi_name() -> str:
-    return await asyncio.to_thread(_sync_get_wifi_name)
+    # 2. Agar hali ham topilmasa, netsh fallback
+    if network_name == "Ulanmagan":
+        try:
+            out = subprocess.check_output(
+                ["netsh", "wlan", "show", "interfaces"],
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                timeout=2
+            ).decode("utf-8", errors="ignore")
+            match = re.search(r"^\s*SSID\s*:\s*(.+)$", out, re.MULTILINE)
+            if match:
+                ssid = match.group(1).strip()
+                if ssid and ssid != "None" and "not running" not in ssid:
+                    network_name = ssid
+        except Exception:
+            pass
 
-# --- Ovoz boshqaruvi (pycaw + ctypes fallback) ---
+    # 3. Mahalliy IP manzilni aniqlash
+    local_ip = "127.0.0.1"
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        pass
+
+    return network_name, local_ip
+
+async def get_network_info() -> Tuple[str, str]:
+    return await asyncio.to_thread(_sync_get_network_info)
+
+# --- Ovoz boshqaruvi (PyCAW Modern + COM Thread Safety + Fallback) ---
 VK_VOLUME_MUTE = 0xAD
 VK_VOLUME_DOWN = 0xAE
 VK_VOLUME_UP = 0xAF
 
-def _sync_get_volume_percent() -> str:
+def _get_pycaw_volume_endpoint():
+    import comtypes
+    comtypes.CoInitialize()
+    from pycaw.pycaw import AudioUtilities
+    speakers = AudioUtilities.GetSpeakers()
+    if not speakers:
+        return None
+    if hasattr(speakers, "EndpointVolume"):
+        return speakers.EndpointVolume
     try:
-        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        from pycaw.pycaw import IAudioEndpointVolume
         from comtypes import CLSCTX_ALL
         from ctypes import cast, POINTER
-        devices = AudioUtilities.GetSpeakers()
-        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        volume = cast(interface, POINTER(IAudioEndpointVolume))
-        current_volume = volume.GetMasterVolumeLevelScalar()
-        return f"{int(round(current_volume * 100))}%"
+        interface = speakers.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        return cast(interface, POINTER(IAudioEndpointVolume))
     except Exception:
-        return "50%"
+        return None
+
+def _sync_get_volume_percent() -> str:
+    try:
+        endpoint = _get_pycaw_volume_endpoint()
+        if endpoint:
+            vol = endpoint.GetMasterVolumeLevelScalar()
+            return f"{int(round(vol * 100))}%"
+    except Exception as e:
+        logger.debug(f"Volume percent error: {e}")
+    return "Aniqlanmadi"
 
 async def get_current_volume_percent() -> str:
     return await asyncio.to_thread(_sync_get_volume_percent)
 
 def _sync_is_muted() -> bool:
     try:
-        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-        from comtypes import CLSCTX_ALL
-        from ctypes import cast, POINTER
-        devices = AudioUtilities.GetSpeakers()
-        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        volume = cast(interface, POINTER(IAudioEndpointVolume))
-        return bool(volume.GetMute())
-    except Exception:
-        return False
+        endpoint = _get_pycaw_volume_endpoint()
+        if endpoint:
+            return bool(endpoint.GetMute())
+    except Exception as e:
+        logger.debug(f"Mute check error: {e}")
+    return False
 
 async def is_muted() -> bool:
     return await asyncio.to_thread(_sync_is_muted)
 
 def _sync_run_volume_action(arg: str) -> str:
     try:
-        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-        from comtypes import CLSCTX_ALL
-        from ctypes import cast, POINTER
-        devices = AudioUtilities.GetSpeakers()
-        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        volume = cast(interface, POINTER(IAudioEndpointVolume))
-        
-        if arg == "up":
-            cur = volume.GetMasterVolumeLevelScalar()
-            volume.SetMasterVolumeLevelScalar(min(1.0, cur + 0.1), None)
-        elif arg == "down":
-            cur = volume.GetMasterVolumeLevelScalar()
-            volume.SetMasterVolumeLevelScalar(max(0.0, cur - 0.1), None)
-        elif arg == "mute":
-            cur_mute = volume.GetMute()
-            volume.SetMute(not cur_mute, None)
-    except Exception:
-        # Fallback via keybd_event
+        endpoint = _get_pycaw_volume_endpoint()
+        if endpoint:
+            if arg == "up":
+                cur = endpoint.GetMasterVolumeLevelScalar()
+                new_vol = min(1.0, cur + 0.1)
+                endpoint.SetMasterVolumeLevelScalar(new_vol, None)
+                if endpoint.GetMute():
+                    endpoint.SetMute(0, None)
+            elif arg == "down":
+                cur = endpoint.GetMasterVolumeLevelScalar()
+                new_vol = max(0.0, cur - 0.1)
+                endpoint.SetMasterVolumeLevelScalar(new_vol, None)
+            elif arg == "mute":
+                cur_mute = endpoint.GetMute()
+                endpoint.SetMute(0 if cur_mute else 1, None)
+        else:
+            # Fallback via keybd_event
+            if arg == "up":
+                ctypes.windll.user32.keybd_event(VK_VOLUME_UP, 0, 0, 0)
+            elif arg == "down":
+                ctypes.windll.user32.keybd_event(VK_VOLUME_DOWN, 0, 0, 0)
+            elif arg == "mute":
+                ctypes.windll.user32.keybd_event(VK_VOLUME_MUTE, 0, 0, 0)
+    except Exception as e:
+        logger.error(f"Volume action error: {e}")
         if arg == "up":
             ctypes.windll.user32.keybd_event(VK_VOLUME_UP, 0, 0, 0)
         elif arg == "down":
@@ -379,20 +500,73 @@ def _sync_take_photo(output_path: str):
     if not cap.isOpened():
         cap = cv2.VideoCapture(0)
     
+    if not cap.isOpened():
+        raise RuntimeError("Veb-kamerani ochib bo'lmadi (kamera ulanmagan yoki boshqa dasturda band).")
+
     try:
-        # Kameraga fokus va yorug'likni moslash uchun 3 ta kadr tashlab o'tish
-        for _ in range(3):
+        # Yorug'lik va avtofokus uchun bir nechta kadr o'tkazib yuborish
+        for _ in range(5):
             cap.read()
         ret, frame = cap.read()
-        if ret:
-            cv2.imwrite(output_path, frame)
+        if ret and frame is not None:
+            cv2.imwrite(output_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
         else:
-            raise RuntimeError("Kameradan tasvir olib bo'lmadi.")
+            raise RuntimeError("Kameradan kadr olib bo'lmadi.")
     finally:
         cap.release()
 
 async def take_photo(output_path: str):
     await asyncio.to_thread(_sync_take_photo, output_path)
+
+# --- Ekran Skrinshoti (Pillow / Win32 GDI) ---
+def _sync_take_screenshot(output_path: str):
+    # 1. Pillow ImageGrab
+    try:
+        from PIL import ImageGrab
+        im = ImageGrab.grab(all_screens=True)
+        if im:
+            im.save(output_path, "JPEG", quality=85)
+            return
+    except Exception:
+        pass
+
+    # 2. Win32 GDI BitBlt
+    try:
+        import win32gui
+        import win32ui
+        import win32con
+        import win32api
+        from PIL import Image
+
+        hwin = win32gui.GetDesktopWindow()
+        width = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
+        height = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+        left = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)
+        top = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)
+
+        hwindc = win32gui.GetWindowDC(hwin)
+        srcdc = win32ui.CreateDCFromHandle(hwindc)
+        memdc = srcdc.CreateCompatibleDC()
+        bmp = win32ui.CreateBitmap()
+        bmp.CreateCompatibleBitmap(srcdc, width, height)
+        memdc.SelectObject(bmp)
+        memdc.BitBlt((0, 0), (width, height), srcdc, (left, top), win32con.SRCCOPY)
+
+        bmpinfo = bmp.GetInfo()
+        bmpstr = bmp.GetBitmapBits(True)
+        im = Image.frombuffer('RGB', (bmpinfo['bmWidth'], bmpinfo['bmHeight']), bmpstr, 'raw', 'BGRX', 0, 1)
+        im.save(output_path, 'JPEG', quality=85)
+
+        win32gui.DeleteObject(bmp.GetHandle())
+        memdc.DeleteDC()
+        srcdc.DeleteDC()
+        win32gui.ReleaseDC(hwin, hwindc)
+        return
+    except Exception as e:
+        raise RuntimeError(f"Skrinshot olib bo'lmadi: {e}")
+
+async def take_screenshot(output_path: str):
+    await asyncio.to_thread(_sync_take_screenshot, output_path)
 
 # --- Spotify & Media boshqaruv ---
 VK_MEDIA_NEXT_TRACK = 0xB0
@@ -431,23 +605,81 @@ async def run_media_control(action: str) -> str:
     return await asyncio.to_thread(_sync_media_control, action)
 
 def _sync_get_music_info() -> Dict[str, str]:
-    info = {"title": "", "artist": "", "album": "", "status": "Faol", "player": "Spotify"}
+    info = {"title": "", "artist": "", "status": "To'xtatilgan", "player": "Aniqlanmadi"}
+    
+    # 1. Spotify oynasini qidirish (ctypes orqali xavfsiz)
     try:
-        import win32gui
-        def enum_windows_callback(hwnd, extra):
-            if win32gui.IsWindowVisible(hwnd):
-                title = win32gui.GetWindowText(hwnd)
-                if title and " - " in title and ("Spotify" in title or "Chrome" in title):
-                    extra.append(title)
-        windows = []
-        win32gui.EnumWindows(enum_windows_callback, windows)
-        if windows:
-            title_part = windows[0].split(" - ")
-            if len(title_part) >= 2:
-                info["artist"] = title_part[0].strip()
-                info["title"] = title_part[1].replace("Spotify", "").strip()
+        user32 = ctypes.windll.user32
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        spotify_titles = []
+
+        def enum_proc(hwnd, lparam):
+            if user32.IsWindowVisible(hwnd):
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buff = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buff, length + 1)
+                    title = buff.value.strip()
+
+                    cls_buff = ctypes.create_unicode_buffer(256)
+                    user32.GetClassNameW(hwnd, cls_buff, 256)
+                    cls_name = cls_buff.value.strip()
+
+                    if "Spotify" in cls_name or cls_name == "Chrome_WidgetWin_0" and " - " in title:
+                        spotify_titles.append(title)
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(enum_proc), 0)
+
+        for title in spotify_titles:
+            if title and " - " in title and title not in ("Spotify", "Spotify Free", "Spotify Premium"):
+                parts = title.split(" - ", 1)
+                info["artist"] = parts[0].strip()
+                info["title"] = parts[1].strip()
+                info["status"] = "Ijro etilmoqda 🟢"
+                info["player"] = "Spotify"
+                return info
+            elif title in ("Spotify", "Spotify Free", "Spotify Premium"):
+                info["player"] = "Spotify"
+                info["status"] = "Pauzada ⏸"
+    except Exception as e:
+        logger.debug(f"Spotify enum error: {e}")
+
+    # 2. WinRT Universal Media Session (Windows 10/11)
+    try:
+        ps_script = """
+[Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media, ContentType = WindowsRuntime] | Out-Null
+$manager = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync().GetAwaiter().GetResult()
+$session = $manager.GetCurrentSession()
+if ($session) {
+    $media = $session.TryGetMediaPropertiesAsync().GetAwaiter().GetResult()
+    $status = $session.GetPlaybackInfo().PlaybackStatus
+    Write-Output ($session.SourceAppUserModelId + "|||" + $media.Artist + "|||" + $media.Title + "|||" + $status)
+}
+"""
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        if res.returncode == 0 and "|||" in res.stdout:
+            parts = res.stdout.strip().split("|||")
+            if len(parts) >= 3:
+                app_id = parts[0]
+                artist = parts[1]
+                title = parts[2]
+                status_raw = parts[3] if len(parts) > 3 else "Playing"
+                
+                if title or artist:
+                    info["title"] = title
+                    info["artist"] = artist or "Noma'lum ijrochi"
+                    info["status"] = "Ijro etilmoqda 🟢" if "Playing" in status_raw or "4" in status_raw else "Pauzada ⏸"
+                    info["player"] = "Spotify" if "Spotify" in app_id else "Media Player"
+                    return info
     except Exception:
         pass
+
     return info
 
 async def get_music_info() -> Dict[str, str]:
@@ -457,21 +689,24 @@ async def build_music_view() -> Tuple[str, InlineKeyboardMarkup]:
     info = await get_music_info()
     title = info.get("title")
     artist = info.get("artist")
+    status = info.get("status")
+    player = info.get("player")
     
     if title:
         meta_text = (
             f"🎧 <b>Trek:</b> <b>{title}</b>\n"
             f"👤 <b>Ijrochi:</b> {artist}\n"
-            f"📊 <b>Holat:</b> Ijro etilmoqda 🟢\n"
-            f"💻 <b>Pleyer:</b> Spotify"
+            f"📊 <b>Holat:</b> {status}\n"
+            f"💻 <b>Pleyer:</b> {player}"
         )
     else:
         meta_text = (
-            "🎧 <b>Spotify Boshqaruvi</b>\n\n"
-            "Musiqani boshqarish uchun quyidagi tugmalardan foydalaning 👇"
+            "🎧 <b>Musiqa Boshqaruvi</b>\n\n"
+            "Hozirda hech qanday musiqa ijro etilmayapti.\n"
+            "Musiqani ochish yoki boshqarish uchun quyidagi tugmalardan foydalaning 👇"
         )
 
-    text = f"🟢 <b>Spotify Boshqaruvi</b>\n\n{meta_text}"
+    text = f"🟢 <b>Spotify & Musiqa Markazi</b>\n\n{meta_text}"
     return text, music_inline_kb
 
 # --- Ekranni qulflash ---
@@ -500,15 +735,40 @@ def _sync_set_clipboard_text(text: str):
 async def set_clipboard_text(text: str):
     await asyncio.to_thread(_sync_set_clipboard_text, text)
 
-# --- Bildirishnoma (Notification) ---
+# --- Bildirishnoma (Native Windows 10/11 Toast) ---
 def _sync_send_notification(text: str, title: str = "Bildirishnoma"):
+    # Xavfsiz Base64 Encoded PowerShell Toast
+    safe_title = title.replace('"', '`"').replace("'", "`'")
+    safe_text = text.replace('"', '`"').replace("'", "`'")
+    
+    ps_code = f"""
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+
+$template = @"
+<toast>
+    <visual>
+        <binding template="ToastGeneric">
+            <text>{safe_title}</text>
+            <text>{safe_text}</text>
+        </binding>
+    </visual>
+</toast>
+"@
+
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml($template)
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("Remote Control").Show($toast)
+"""
     try:
-        from plyer import notification
-        notification.notify(title=title, message=text, app_name="Remote Control", timeout=5)
-    except Exception:
-        # Fallback via PowerShell
-        ps_cmd = f'[reflection.assembly]::loadwithpartialname("System.Windows.Forms"); [Windows.Forms.MessageBox]::Show("{text}", "{title}")'
-        subprocess.Popen(["powershell", "-WindowStyle", "Hidden", "-Command", ps_cmd])
+        encoded_ps = base64.b64encode(ps_code.encode("utf-16le")).decode("utf-8")
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-EncodedCommand", encoded_ps],
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        )
+    except Exception as e:
+        logger.error(f"Toast notification xatosi: {e}")
 
 async def send_desktop_notification(text: str, title: str = "Bildirishnoma"):
     await asyncio.to_thread(_sync_send_notification, text, title)
@@ -535,10 +795,18 @@ async def execute_reboot():
 async def build_status_view() -> Tuple[str, InlineKeyboardMarkup]:
     cpu = psutil.cpu_percent(interval=None)
     ram = psutil.virtual_memory().percent
-    disk = psutil.disk_usage(os.path.splitdrive(os.path.abspath(__file__))[0] + "\\")
-    disk_percent = disk.percent
-    free_gb = disk.free / (1024 ** 3)
+    
+    # Disk holati
+    try:
+        drive = os.path.splitdrive(os.path.abspath(__file__))[0] + "\\"
+        disk = psutil.disk_usage(drive)
+        disk_percent = disk.percent
+        free_gb = disk.free / (1024 ** 3)
+    except Exception:
+        disk_percent = 0
+        free_gb = 0
 
+    # Batareya holati
     battery = psutil.sensors_battery()
     if battery:
         bat_state = "Zaryadlanmoqda ⚡️" if battery.power_plugged else "Batareyada 🔋"
@@ -546,11 +814,12 @@ async def build_status_view() -> Tuple[str, InlineKeyboardMarkup]:
     else:
         bat_text = "Mavjud emas"
 
-    wifi_name, volume, muted, current_app = await asyncio.gather(
-        get_wifi_name(),
+    # Tarmoq, Ovoz, Faol dastur
+    (network_name, local_ip), volume, muted, (current_app, win_title) = await asyncio.gather(
+        get_network_info(),
         get_current_volume_percent(),
         is_muted(),
-        get_active_window_name(),
+        get_active_window_full(),
     )
 
     volume_text = f"<b>{volume}</b>" + (" <i>(O'chirilgan 🔇)</i>" if muted else "")
@@ -560,15 +829,19 @@ async def build_status_view() -> Tuple[str, InlineKeyboardMarkup]:
     cpu_bar = make_progress_bar(cpu)
     ram_bar = make_progress_bar(ram)
 
+    app_display = f"<b>{current_app}</b>"
+    if win_title and win_title != current_app and len(win_title) < 50:
+        app_display += f" — <i>{win_title}</i>"
+
     text = (
         f"🖥 <b>Tizim Holati</b> • <code>{device_name}</code>\n\n"
         f"⚡️ <b>CPU:</b> <code>{cpu_bar}</code> {cpu}%\n"
         f"🧠 <b>RAM:</b> <code>{ram_bar}</code> {ram}%\n"
         f"🔋 <b>Batareya:</b> {bat_text}\n"
         f"💽 <b>Disk:</b> {disk_percent}% band <i>({free_gb:.1f} GB bo'sh)</i>\n"
-        f"📶 <b>Wi-Fi:</b> <code>{wifi_name}</code>\n"
+        f"📶 <b>Tarmoq:</b> <code>{network_name}</code> <i>({local_ip})</i>\n"
         f"🔊 <b>Ovoz:</b> {volume_text}\n"
-        f"📱 <b>Faol oyna:</b> <b>{current_app}</b>\n\n"
+        f"📱 <b>Faol oyna:</b> {app_display}\n\n"
         f"🕒 <i>Yangilandi: {now_str}</i>"
     )
     return text, status_inline_kb
@@ -595,7 +868,7 @@ def build_daily_report_text(stats_dict: Optional[Dict[str, Any]] = None) -> str:
     merged_apps = Counter()
     for raw_k, count in stats.get("app_minutes", {}).items():
         cleaned_k = clean_app_name(raw_k)
-        if cleaned_k and cleaned_k not in SYSTEM_IGNORE_CLASSES:
+        if cleaned_k and cleaned_k.lower() not in SYSTEM_IGNORE_APPS:
             merged_apps[cleaned_k] += count
 
     top_apps = merged_apps.most_common(8)
@@ -624,21 +897,34 @@ def build_daily_report_text(stats_dict: Optional[Dict[str, Any]] = None) -> str:
     )
 
 # ==============================================================================
-# 7. TELEGRAM BOT INIT VA MIDDLEWARE
+# 7. XAVFSIZLIK VA MIDDLEWARE (ADMIN AUTH)
 # ==============================================================================
+
+class AdminAuthMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Any],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        user = data.get("event_from_user")
+        if not user:
+            return
+
+        if user.id != ADMIN_ID:
+            logger.warning(f"Ruxsatsiz urinish! ID: {user.id}, Username: @{user.username}, Ism: {user.full_name}")
+            if isinstance(event, types.Message):
+                await event.reply("⛔️ Kechirasiz, siz ushbu noutbuk boshqaruvchisi emassiz!")
+            elif isinstance(event, types.CallbackQuery):
+                await event.answer("⛔️ Ruxsat berilmagan!", show_alert=True)
+            return
+
+        return await handler(event, data)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-
-@dp.message(F.from_user.id != ADMIN_ID)
-async def unauthorized_message(message: types.Message):
-    user = message.from_user
-    logger.warning(f"Ruxsatsiz xabar! ID: {user.id}, Username: @{user.username}")
-    await message.reply("⛔️ Kechirasiz, siz ushbu noutbuk boshqaruvchisi emassiz!")
-
-@dp.callback_query(F.from_user.id != ADMIN_ID)
-async def unauthorized_callback(callback: CallbackQuery):
-    await callback.answer("⛔️ Ruxsat berilmagan!", show_alert=True)
+dp.message.outer_middleware(AdminAuthMiddleware())
+dp.callback_query.outer_middleware(AdminAuthMiddleware())
 
 # ==============================================================================
 # 8. HANDLERS VA BUYRUQLAR
@@ -651,7 +937,7 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "🤖 <b>Masofaviy Boshqaruv Markazi (Windows)</b>\n"
         f"💻 <b>Qurilma:</b> <code>{device_name}</code>\n\n"
-        "Noutbukingizni nazorat qilish va boshqarish uchun menyudan foydalaning 👇",
+        "Noutbukingizni nazorat qilish va masofadan boshqarish uchun quyidagi menyudan foydalaning 👇",
         parse_mode="HTML",
         reply_markup=main_menu,
     )
@@ -677,13 +963,19 @@ async def cmd_report(message: types.Message):
     report_text = build_daily_report_text()
     await message.answer(report_text, parse_mode="HTML")
 
+# --- Kamera fotosi ---
 async def handle_photo_capture(target_chat_id: int):
     now_str = datetime.now(UZ_TZ).strftime("%H:%M:%S")
-    cam_file = os.path.join(BASE_DIR, f"cam_shot_{int(datetime.now().timestamp())}.jpg")
+    cam_file = os.path.join(tempfile.gettempdir(), f"cam_shot_{int(datetime.now().timestamp())}.jpg")
     try:
         await take_photo(cam_file)
         photo = FSInputFile(cam_file)
-        await bot.send_photo(chat_id=target_chat_id, photo=photo, caption=f"📸 <b>Veb-kamera surati</b> • <i>{now_str}</i>", parse_mode="HTML")
+        await bot.send_photo(
+            chat_id=target_chat_id,
+            photo=photo,
+            caption=f"📸 <b>Veb-kamera surati</b> • <i>{now_str}</i>",
+            parse_mode="HTML"
+        )
         logger.info("Kamera surati yuborildi.")
     except Exception as e:
         logger.error(f"Kamera xatosi: {e}")
@@ -710,26 +1002,73 @@ async def callback_quick_photo(callback: CallbackQuery):
     await callback.answer("📸 Surat olinmoqda...")
     await handle_photo_capture(callback.message.chat.id)
 
+# --- Ekran Skrinshoti ---
+async def handle_screenshot_capture(target_chat_id: int):
+    now_str = datetime.now(UZ_TZ).strftime("%H:%M:%S")
+    scr_file = os.path.join(tempfile.gettempdir(), f"scr_shot_{int(datetime.now().timestamp())}.jpg")
+    try:
+        await take_screenshot(scr_file)
+        photo = FSInputFile(scr_file)
+        await bot.send_photo(
+            chat_id=target_chat_id,
+            photo=photo,
+            caption=f"🖥 <b>Ekran Skrinshoti</b> • <i>{now_str}</i>",
+            parse_mode="HTML"
+        )
+        logger.info("Ekran skrinshoti yuborildi.")
+    except Exception as e:
+        logger.error(f"Skrinshot xatosi: {e}")
+        await bot.send_message(chat_id=target_chat_id, text=f"❌ Skrinshot xatoligi: {e}")
+    finally:
+        if os.path.exists(scr_file):
+            try:
+                os.remove(scr_file)
+            except Exception:
+                pass
+
+@dp.message(Command("screenshot", "screen"))
+@dp.message(F.text.in_({"🖥 Ekran (Skrinshot)", "🖥 Ekran", "Skrinshot", "/screenshot", "/screen"}))
+async def cmd_screenshot(message: types.Message):
+    msg = await message.answer("🖥 Ekran surati olinmoqda, kuting...")
+    await handle_screenshot_capture(message.chat.id)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+@dp.callback_query(F.data == "quick_screenshot")
+async def callback_quick_screenshot(callback: CallbackQuery):
+    await callback.answer("🖥 Skrinshot olinmoqda...")
+    await handle_screenshot_capture(callback.message.chat.id)
+
+# --- Spotify & Musiqa ---
 @dp.message(Command("music", "spotify"))
 @dp.message(F.text.in_({"🎵 Spotify", "Spotify", "🎵 Musiqa", "Musiqa", "/music", "/spotify"}))
 async def cmd_music(message: types.Message):
-    logger.info(f"Admin Spotify bo'limiga kirdi. (Xabar: '{message.text}')")
-    asyncio.create_task(open_spotify())
-    await asyncio.sleep(0.3)
+    logger.info("Spotify bo'limi ochildi.")
     try:
         text, kb = await build_music_view()
         await message.answer(text, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
         logger.error(f"cmd_music xatosi: {e}")
-        await message.answer("🟢 <b>Spotify Boshqaruvi</b>\n\nSpotify noutbukda ochilmoqda...", parse_mode="HTML", reply_markup=music_inline_kb)
+        await message.answer("🟢 <b>Spotify Boshqaruvi</b>", parse_mode="HTML", reply_markup=music_inline_kb)
 
 @dp.callback_query(F.data == "quick_music")
 async def callback_quick_music(callback: CallbackQuery):
-    asyncio.create_task(open_spotify())
-    await asyncio.sleep(0.3)
     text, kb = await build_music_view()
     await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
-    await callback.answer("🟢 Spotify ochilmoqda...")
+    await callback.answer()
+
+@dp.callback_query(F.data == "mus_open")
+async def callback_mus_open(callback: CallbackQuery):
+    await open_spotify()
+    await callback.answer("🚀 Spotify ochilmoqda...")
+    await asyncio.sleep(1.0)
+    try:
+        text, kb = await build_music_view()
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        pass
 
 @dp.callback_query(F.data == "mus_refresh")
 async def callback_mus_refresh(callback: CallbackQuery):
@@ -753,6 +1092,48 @@ async def callback_mus_controls(callback: CallbackQuery):
     except Exception:
         pass
 
+# --- Ovoz boshqaruvi ---
+@dp.message(F.text == "🔊 Ovoz")
+async def volume_button(message: types.Message):
+    vol = await get_current_volume_percent()
+    muted = await is_muted()
+    muted_str = " <i>(O'chirilgan 🔇)</i>" if muted else ""
+    text = f"🔊 <b>Ovoz Boshqaruvi</b>\n\n🔈 <b>Joriy daraja:</b> <b>{vol}</b>{muted_str}"
+    await message.answer(text, parse_mode="HTML", reply_markup=volume_kb)
+
+@dp.callback_query(F.data == "quick_volume")
+async def callback_quick_volume(callback: CallbackQuery):
+    vol = await get_current_volume_percent()
+    muted = await is_muted()
+    muted_str = " <i>(O'chirilgan 🔇)</i>" if muted else ""
+    text = f"🔊 <b>Ovoz Boshqaruvi</b>\n\n🔈 <b>Joriy daraja:</b> <b>{vol}</b>{muted_str}"
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=volume_kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "vol_refresh")
+async def callback_vol_refresh(callback: CallbackQuery):
+    vol = await get_current_volume_percent()
+    muted = await is_muted()
+    muted_str = " <i>(O'chirilgan 🔇)</i>" if muted else ""
+    text = f"🔊 <b>Ovoz Boshqaruvi</b>\n\n🔈 <b>Joriy daraja:</b> <b>{vol}</b>{muted_str}"
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=volume_kb)
+        await callback.answer("✅ Yangilandi")
+    except Exception:
+        await callback.answer()
+
+@dp.callback_query(F.data.in_({"vol_up", "vol_down", "vol_mute"}))
+async def volume_callback(callback: CallbackQuery):
+    action_map = {"vol_up": "up", "vol_down": "down", "vol_mute": "mute"}
+    arg = action_map[callback.data]
+    try:
+        result_text = await run_volume_action(arg)
+        await callback.message.edit_text(result_text, parse_mode="HTML", reply_markup=volume_kb)
+    except Exception as e:
+        logger.error(f"Ovoz callback xatosi: {e}")
+    await callback.answer()
+
+# --- Ekranni qulflash ---
 @dp.message(Command("lock"))
 @dp.message(F.text == "🔒 Qulflash")
 async def cmd_lock(message: types.Message):
@@ -764,43 +1145,15 @@ async def cmd_lock(message: types.Message):
         logger.error(f"Qulflashda xato: {e}")
         await message.answer(f"❌ Qulflashda xatolik yuz berdi: {e}")
 
-@dp.message(F.text == "🔔 Xabar yuborish")
-async def notify_button(message: types.Message, state: FSMContext):
-    await state.set_state(NotifyState.waiting_text)
-    await message.answer("✍️ Noutbuk ekranida ko'rsatiladigan xabarni yozing:")
-
-@dp.message(NotifyState.waiting_text)
-async def notify_receive_text(message: types.Message, state: FSMContext):
-    text = message.text
-    await state.clear()
+@dp.callback_query(F.data == "quick_lock")
+async def callback_quick_lock(callback: CallbackQuery):
     try:
-        await send_desktop_notification(text)
-        await message.answer("🔔 <b>Xabar noutbuk ekranida ko'rsatildi!</b>", parse_mode="HTML", reply_markup=main_menu)
-        logger.info(f"Ekranga xabar chiqarildi: {text[:40]}")
+        await lock_screen()
+        await callback.answer("🔒 Ekran qulflandi!", show_alert=True)
     except Exception as e:
-        logger.error(f"Ekranga xabar chiqarishda xato: {e}")
-        await message.answer(f"❌ Xatolik: {e}", reply_markup=main_menu)
+        await callback.answer(f"❌ Xato: {e}", show_alert=True)
 
-@dp.message(F.text == "🔊 Ovoz")
-async def volume_button(message: types.Message):
-    vol = await get_current_volume_percent()
-    muted = await is_muted()
-    muted_str = " <i>(O'chirilgan 🔇)</i>" if muted else ""
-    text = f"🔊 <b>Ovoz Boshqaruvi</b>\n\n🔈 <b>Joriy daraja:</b> <b>{vol}</b>{muted_str}"
-    await message.answer(text, parse_mode="HTML", reply_markup=volume_kb)
-
-@dp.callback_query(F.data.in_({"vol_up", "vol_down", "vol_mute"}))
-async def volume_callback(callback: CallbackQuery):
-    action_map = {"vol_up": "up", "vol_down": "down", "vol_mute": "mute"}
-    arg = action_map[callback.data]
-    try:
-        result_text = await run_volume_action(arg)
-        await callback.message.edit_text(result_text, parse_mode="HTML", reply_markup=volume_kb)
-    except Exception as e:
-        logger.error(f"Ovoz callback xatosi: {e}")
-        await callback.message.edit_text(f"❌ Xatolik: {e}", reply_markup=volume_kb)
-    await callback.answer()
-
+# --- Clipboard ---
 @dp.message(F.text == "📋 Clipboard")
 async def clipboard_button(message: types.Message):
     await message.answer(
@@ -838,15 +1191,39 @@ async def clipboard_receive_text(message: types.Message, state: FSMContext):
         logger.error(f"Clipboard yozish xatosi: {e}")
         await message.answer(f"❌ Xatolik: {e}", reply_markup=main_menu)
 
-@dp.message(Command("reboot"))
-@dp.message(F.text == "🔄 Qayta yoqish")
-async def cmd_reboot(message: types.Message):
-    await message.answer("⚠️ Noutbukni <b>qayta ishga tushirishni</b> tasdiqlaysizmi?", parse_mode="HTML", reply_markup=confirm_kb("reboot"))
+# --- Bildirishnoma (Notification) ---
+@dp.message(F.text == "🔔 Xabar yuborish")
+async def notify_button(message: types.Message, state: FSMContext):
+    await state.set_state(NotifyState.waiting_text)
+    await message.answer("✍️ Noutbuk ekranida ko'rsatiladigan xabarni yozing:")
 
-@dp.message(Command("shutdown"))
-@dp.message(F.text == "🛑 O'chirish")
-async def cmd_shutdown(message: types.Message):
-    await message.answer("⚠️ Noutbukni <b>butunlay o'chirishni</b> tasdiqlaysizmi?", parse_mode="HTML", reply_markup=confirm_kb("shutdown"))
+@dp.message(NotifyState.waiting_text)
+async def notify_receive_text(message: types.Message, state: FSMContext):
+    text = message.text
+    await state.clear()
+    try:
+        await send_desktop_notification(text, title="Telegramdan Bildirishnoma")
+        await message.answer("🔔 <b>Xabar noutbuk ekraniga yuborildi!</b>", parse_mode="HTML", reply_markup=main_menu)
+        logger.info(f"Ekranga bildirishnoma chiqarildi: {text[:40]}")
+    except Exception as e:
+        logger.error(f"Ekranga xabar chiqarishda xato: {e}")
+        await message.answer(f"❌ Xatolik: {e}", reply_markup=main_menu)
+
+# --- Quvvat va O'chirish Menyusi ---
+@dp.message(Command("power"))
+@dp.message(F.text.in_({"⚡️ Quvvat / O'chirish", "🔄 Qayta yoqish", "🛑 O'chirish"}))
+async def cmd_power(message: types.Message):
+    await message.answer("⚡️ <b>Quvvat va Tizim Boshqaruvi</b>\n\nKerakli amalni tanlang:", parse_mode="HTML", reply_markup=power_menu_kb)
+
+@dp.callback_query(F.data == "ask_reboot")
+async def ask_reboot(callback: CallbackQuery):
+    await callback.message.edit_text("⚠️ Noutbukni <b>qayta ishga tushirishni (Reboot)</b> tasdiqlaysizmi?", parse_mode="HTML", reply_markup=confirm_kb("reboot"))
+    await callback.answer()
+
+@dp.callback_query(F.data == "ask_shutdown")
+async def ask_shutdown(callback: CallbackQuery):
+    await callback.message.edit_text("⚠️ Noutbukni <b>butunlay o'chirishni (Shutdown)</b> tasdiqlaysizmi?", parse_mode="HTML", reply_markup=confirm_kb("shutdown"))
+    await callback.answer()
 
 @dp.callback_query(F.data == "confirm_reboot")
 async def confirm_reboot(callback: CallbackQuery):
@@ -866,14 +1243,14 @@ async def confirm_shutdown(callback: CallbackQuery):
     await asyncio.sleep(0.5)
     asyncio.create_task(execute_shutdown())
 
-@dp.callback_query(F.data == "cancel")
+@dp.callback_query(F.data == "cancel_action")
 async def cancel_action(callback: CallbackQuery):
     await callback.message.edit_text("❌ Amal bekor qilindi.")
     await callback.answer()
 
 @dp.message()
 async def fallback_unknown_message(message: types.Message):
-    logger.info(f"Admin noma'lum xabar yubordi: '{message.text}'")
+    logger.info(f"Admin xabar yubordi: '{message.text}'")
     await message.answer("🤖 Quyidagi menyudan buyruqni tanlang:", reply_markup=main_menu)
 
 # ==============================================================================
@@ -887,12 +1264,22 @@ async def app_tracker_loop():
         try:
             today_str = datetime.now(UZ_TZ).strftime("%Y-%m-%d")
             if today_str != daily_stats.get("date"):
+                # Kun almashganda kechagini arxivlash
+                old_date = daily_stats.get("date", "previous")
+                archive_path = os.path.join(HISTORY_DIR, f"stats_{old_date}.json")
+                try:
+                    with open(archive_path, "w", encoding="utf-8") as af:
+                        json.dump(daily_stats, af, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+
                 daily_stats["date"] = today_str
                 daily_stats["app_minutes"] = {}
                 daily_stats["battery_samples"] = []
                 daily_stats["report_sent"] = False
                 low_battery_notified = False
 
+            # Batareya monitoringi
             battery = psutil.sensors_battery()
             if battery:
                 pct = round(battery.percent)
@@ -916,8 +1303,9 @@ async def app_tracker_loop():
                 elif battery.power_plugged:
                     low_battery_notified = False
 
+            # Faol dastur kuzatuvi
             current_app = await get_active_window_name()
-            if current_app and current_app not in SYSTEM_IGNORE_CLASSES:
+            if current_app and current_app.lower() not in SYSTEM_IGNORE_APPS:
                 daily_stats["app_minutes"][current_app] = daily_stats["app_minutes"].get(current_app, 0) + 1
 
             save_daily_stats()
@@ -943,24 +1331,36 @@ async def daily_report_scheduler():
 
         await asyncio.sleep(30)
 
+async def wait_for_internet_connection(max_attempts: int = 10, delay: float = 3.0) -> bool:
+    logger.info("Internet aloqasi tekshirilmoqda...")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await bot.get_me()
+            logger.info("Telegram API bilan aloqa o'rnatildi.")
+            return True
+        except Exception as e:
+            logger.warning(f"Internetga ulanish kutilmoqda ({attempt}/{max_attempts}): {e}")
+            await asyncio.sleep(delay)
+    return False
+
 async def on_startup_notify():
     boot_time = datetime.now(UZ_TZ).strftime("%Y-%m-%d %H:%M:%S")
     battery = psutil.sensors_battery()
     bat_text = f"{round(battery.percent)}%" if battery else "Aniqlanmadi"
-    wifi_name = await get_wifi_name()
+    network_name, local_ip = await get_network_info()
     device_name = get_device_name()
 
     text = (
         "🟢 <b>Noutbuk Ishga Tushdi (Windows)</b>\n"
         f"💻 <code>{device_name}</code>\n\n"
         f"🔋 <b>Batareya:</b> {bat_text}\n"
-        f"📶 <b>Wi-Fi:</b> <code>{wifi_name}</code>\n"
+        f"📶 <b>Tarmoq:</b> <code>{network_name}</code> <i>({local_ip})</i>\n"
         f"🕒 <b>Vaqt:</b> {boot_time}\n\n"
-        "<i>Bot boshqaruvga tayyor 👇</i>"
+        "<i>Bot boshqaruvga to'liq tayyor 👇</i>"
     )
     try:
         await bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML", reply_markup=main_menu)
-        logger.info("Startup notification yuborildi.")
+        logger.info("Startup bildirishnomasi Telegramga muvaffaqiyatli yuborildi.")
     except Exception as e:
         logger.error(f"Startup xatoligi: {e}")
 
@@ -970,7 +1370,13 @@ async def main():
     logger.info(f"ADMIN_ID: {ADMIN_ID}, TIMEZONE: {TIMEZONE_STR}")
 
     load_daily_stats()
-    await on_startup_notify()
+
+    # Internet aloqasini kutish
+    is_connected = await wait_for_internet_connection()
+    if is_connected:
+        await on_startup_notify()
+    else:
+        logger.warning("Internetga ulanib bo'lmadi, lekin bot ishlashda davom etadi...")
 
     asyncio.create_task(app_tracker_loop())
     asyncio.create_task(daily_report_scheduler())
