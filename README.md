@@ -50,28 +50,25 @@ LOW_BATTERY_THRESHOLD=20
 
 ---
 
-## 🚀 Ishga Tushirish Usullari
+## 🚀 Ishga Tushirish va Boshqarish
 
-### 1-usul: Oddiy ishga tushirish (Konsol oynasi bilan)
-Papkadagi **`start_bot.bat`** faylini ikki marta bosing.
-U avtomatik ravishda virtual muhitni (`venv`) yaratadi, paketlarni o'rnatadi va botni ishga tushiradi.
+Loyiha juda sodda va qulay **2 ta fayl** orqali boshqariladi:
+
+### 1. `start.bat` — 1-Bosishda Ishga Tushirish va Avtostart
+Papkadagi **`start.bat`** faylini ikki marta bosing. Hech qanday ortiqcha tanlovlarsiz u:
+1. Python va paketlarni tekshiradi (kerak bo'lsa avtomatik o'rnatadi).
+2. Windows Avtostart tizimiga ulaydi.
+3. Botni orqa fonda (qora oynasiz / silent) ishga tushiradi va konsol oynasi 3 soniyada avtomatik yopiladi.
+
+> 💡 *Endi kompyuteringiz har safar yoqilganda bot avtomatik fonda ishga tushadi, internet ulanganda Telegramingizga **"🟢 Noutbuk Ishga Tushdi (Windows)"** xabarini yuboradi! Barcha qaydlar `bot.log` fayliga yozib boriladi.*
 
 ---
 
-### 2-usul: Fonda (Qora oynasiz / Silent) ishga tushirish
-Agar konsol oynasi ko'rinmasdan, bot fonda jimgina ishlashini xohlasangiz:
-* **`start_hidden.vbs`** faylini ikki marta bosing.
-
----
-
-### 3-usul: Kompyuter yoqilganda avtomatik ishga tushirish (Autostart)
-Windows yoqilganda bot avtomatik fonda ishlashi uchun:
-
-1. Klaviaturada **`Win + R`** tugmalarini bosing;
-2. **`shell:startup`** deb yozib, **Enter** bosing (Windows Avtostart papkasi ochiladi);
-3. Ushbu papka ichiga loyihangizdagi **`start_hidden.vbs`** faylining **Yorlig'ini (Shortcut / Ярлык)** tashlab qo'ying.
-
-> 💡 *Endi kompyuteringiz yoqilishi bilan bot avtomatik fonda ishga tushadi, internetga ulanishni kutadi va Telegramingizga **"🟢 Noutbuk Ishga Tushdi"** xabarini yuboradi!*
+### 2. `stop.bat` — 1-Bosishda To'liq To'xtatish
+Botni fondan butunlay to'xtatish va Windows avtostartidan o'chirish uchun **`stop.bat`** faylini ikki marta bosing. U:
+1. Fondagi barcha bot jarayonlarini yopadi.
+2. Windows Avtostartdan yorliqni olib tashlaydi.
+3. Oyna 3 soniyada avtomatik yopiladi.
 
 ---
 

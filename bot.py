@@ -86,20 +86,45 @@ STATS_FILE = os.path.join(BASE_DIR, "daily_stats.json")
 HISTORY_DIR = os.path.join(BASE_DIR, "history")
 os.makedirs(HISTORY_DIR, exist_ok=True)
 
+# pythonw.exe (silent fon rejimi) da sys.stdout va sys.stderr None bo'ladi
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
 # ==============================================================================
-# 2. LOGGING SOZLAMALARI (Faqat Konsol / Stdout)
+# 2. LOGGING SOZLAMALARI (Stdout va bot.log fayliga real vaqtda yozish)
 # ==============================================================================
 
+class FlushingFileHandler(logging.FileHandler):
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
+LOG_FILE = os.path.join(BASE_DIR, "bot.log")
+
+file_handler = FlushingFileHandler(LOG_FILE, encoding="utf-8")
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+
+handlers_list: List[logging.Handler] = [file_handler]
+try:
+    if sys.stdout and hasattr(sys.stdout, "isatty") and sys.stdout.isatty():
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setLevel(logging.INFO)
+        stream_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        handlers_list.append(stream_handler)
+except Exception:
+    pass
 
 logging.basicConfig(
     level=logging.INFO,
-    format=LOG_FORMAT,
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=handlers_list,
+    force=True,
 )
 logger = logging.getLogger("remote_win_bot")
+logger.setLevel(logging.INFO)
 
 # ==============================================================================
 # 3. GLOBAL STATISTIKA VA XOTIRA
@@ -1138,20 +1163,27 @@ async def volume_callback(callback: CallbackQuery):
 @dp.message(F.text == "🔒 Qulflash")
 async def cmd_lock(message: types.Message):
     try:
-        await lock_screen()
         await message.answer("🔒 <b>Ekran muvaffaqiyatli qulflandi!</b>", parse_mode="HTML")
         logger.info("Ekran masofadan qulflandi.")
     except Exception as e:
+        logger.warning(f"Xabar yuborishda ogohlantirish: {e}")
+    await asyncio.sleep(0.3)
+    try:
+        await lock_screen()
+    except Exception as e:
         logger.error(f"Qulflashda xato: {e}")
-        await message.answer(f"❌ Qulflashda xatolik yuz berdi: {e}")
 
 @dp.callback_query(F.data == "quick_lock")
 async def callback_quick_lock(callback: CallbackQuery):
     try:
-        await lock_screen()
         await callback.answer("🔒 Ekran qulflandi!", show_alert=True)
     except Exception as e:
-        await callback.answer(f"❌ Xato: {e}", show_alert=True)
+        logger.warning(f"Callback javobida ogohlantirish: {e}")
+    await asyncio.sleep(0.3)
+    try:
+        await lock_screen()
+    except Exception as e:
+        logger.error(f"Qulflashda xato: {e}")
 
 # --- Clipboard ---
 @dp.message(F.text == "📋 Clipboard")
@@ -1331,7 +1363,7 @@ async def daily_report_scheduler():
 
         await asyncio.sleep(30)
 
-async def wait_for_internet_connection(max_attempts: int = 10, delay: float = 3.0) -> bool:
+async def wait_for_internet_connection(max_attempts: int = 60, delay: float = 4.0) -> bool:
     logger.info("Internet aloqasi tekshirilmoqda...")
     for attempt in range(1, max_attempts + 1):
         try:
@@ -1339,7 +1371,8 @@ async def wait_for_internet_connection(max_attempts: int = 10, delay: float = 3.
             logger.info("Telegram API bilan aloqa o'rnatildi.")
             return True
         except Exception as e:
-            logger.warning(f"Internetga ulanish kutilmoqda ({attempt}/{max_attempts}): {e}")
+            if attempt % 5 == 1 or attempt == max_attempts:
+                logger.warning(f"Internetga ulanish kutilmoqda ({attempt}/{max_attempts}): {e}")
             await asyncio.sleep(delay)
     return False
 
@@ -1371,18 +1404,30 @@ async def main():
 
     load_daily_stats()
 
-    # Internet aloqasini kutish
-    is_connected = await wait_for_internet_connection()
-    if is_connected:
-        await on_startup_notify()
-    else:
-        logger.warning("Internetga ulanib bo'lmadi, lekin bot ishlashda davom etadi...")
-
     asyncio.create_task(app_tracker_loop())
     asyncio.create_task(daily_report_scheduler())
 
+    # Internet ulanishini kutish va Startup xabarini jo'natish
+    startup_sent = False
+    while not startup_sent:
+        is_connected = await wait_for_internet_connection(max_attempts=30, delay=4.0)
+        if is_connected:
+            await on_startup_notify()
+            startup_sent = True
+        else:
+            logger.warning("Internet hali ulanmadi, 10 soniyadan keyin qayta tekshiriladi...")
+            await asyncio.sleep(10)
+
+    # Polling tsikli: aloqa uzilsa ham bot yopilib ketmasdan avtomatik qayta ulanadi
     try:
-        await dp.start_polling(bot, drop_pending_updates=True)
+        while True:
+            try:
+                logger.info("Telegram bot polling boshlandi...")
+                await dp.start_polling(bot, drop_pending_updates=True)
+                break
+            except Exception as e:
+                logger.error(f"Polling xatoligi: {e}. 10 soniyadan so'ng qayta ulanishga uriniladi...")
+                await asyncio.sleep(10)
     finally:
         save_daily_stats()
         await bot.session.close()
